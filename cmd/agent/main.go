@@ -2,7 +2,6 @@ package main
 
 import (
 	"context"
-	"encoding/json"
 	"fmt"
 	"os"
 	"strings"
@@ -27,31 +26,40 @@ func main() {
 
 	workingDirectory, err := os.Getwd()
 	if err != nil {
-		fmt.Fprintf(os.Stderr, "获取当前目录失败：%v\n", err)
-		os.Exit(1)
+		exitWithError("获取当前目录失败", err)
 	}
 
 	readFileTool, err := agenttool.NewReadFileTool(workingDirectory)
 	if err != nil {
-		fmt.Fprintf(os.Stderr, "创建 read_file 工具失败：%v\n", err)
-		os.Exit(1)
+		exitWithError("创建 read_file 工具失败", err)
 	}
 
-	arguments, err := json.Marshal(map[string]string{
-		"path": path,
-	})
-	if err != nil {
-		fmt.Fprintf(os.Stderr, "编码参数失败：%v\n", err)
-		os.Exit(1)
+	registry := agenttool.NewRegistry()
+
+	if err := registry.Register(readFileTool); err != nil {
+		exitWithError("注册 read_file 工具失败", err)
 	}
 
-	result, err := readFileTool.Execute(context.Background(), arguments)
+	result, err := registry.ExecuteRaw(
+		context.Background(),
+		"manual_call_001",
+		"read_file",
+		map[string]string{
+			"path": path,
+		},
+	)
 	if err != nil {
-		fmt.Fprintf(os.Stderr, "读取文件失败：%v\n", err)
-		os.Exit(1)
+		exitWithError("执行工具失败", err)
 	}
 
 	fmt.Println("Go Pi Agent")
 	fmt.Println("------------")
-	fmt.Println(result)
+	fmt.Printf("Tool: %s\n", result.Name)
+	fmt.Printf("Tool Call ID: %s\n\n", result.ToolCallID)
+	fmt.Println(result.Content)
+}
+
+func exitWithError(message string, err error) {
+	fmt.Fprintf(os.Stderr, "%s：%v\n", message, err)
+	os.Exit(1)
 }
