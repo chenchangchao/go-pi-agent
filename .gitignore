@@ -1,6 +1,10 @@
 # Environment variables
 .env
-.env.*
+.env.local
+.env.*.local
+
+# 保留配置模板
+!.env.example
 
 # Build output
 bin/

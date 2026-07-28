@@ -5,58 +5,101 @@ import (
 	"fmt"
 	"os"
 	"strings"
+	"time"
 
-	"github.com/chenchangchao/go-pi-agent/internal/agenttool"
+	"github.com/chenchangchao/go-pi-agent/internal/agentcore"
+	"github.com/chenchangchao/go-pi-agent/internal/provider"
+	"github.com/joho/godotenv"
 )
 
 func main() {
+	if err := godotenv.Load(); err != nil {
+		fmt.Fprintln(
+			os.Stderr,
+			"提示：未读取到 .env，将使用系统环境变量",
+		)
+	}
 	if len(os.Args) < 2 {
 		fmt.Fprintln(
 			os.Stderr,
-			`用法: go run ./cmd/agent "文件路径"`,
+			`用法: go run ./cmd/agent "你的问题"`,
 		)
 		os.Exit(1)
 	}
 
-	path := strings.TrimSpace(strings.Join(os.Args[1:], " "))
-	if path == "" {
-		fmt.Fprintln(os.Stderr, "错误：文件路径不能为空")
+	prompt := strings.TrimSpace(
+		strings.Join(os.Args[1:], " "),
+	)
+	if prompt == "" {
+		fmt.Fprintln(os.Stderr, "错误：问题不能为空")
 		os.Exit(1)
 	}
 
-	workingDirectory, err := os.Getwd()
-	if err != nil {
-		exitWithError("获取当前目录失败", err)
+	model := strings.TrimSpace(
+		os.Getenv("OPENAI_MODEL"),
+	)
+	baseURL := strings.TrimSpace(
+		os.Getenv("OPENAI_BASE_URL"),
+	)
+	apiKey := strings.TrimSpace(
+		os.Getenv("OPENAI_API_KEY"),
+	)
+
+	if model == "" {
+		fmt.Fprintln(
+			os.Stderr,
+			"错误：未设置 OPENAI_MODEL",
+		)
+		os.Exit(1)
 	}
 
-	readFileTool, err := agenttool.NewReadFileTool(workingDirectory)
-	if err != nil {
-		exitWithError("创建 read_file 工具失败", err)
-	}
-
-	registry := agenttool.NewRegistry()
-
-	if err := registry.Register(readFileTool); err != nil {
-		exitWithError("注册 read_file 工具失败", err)
-	}
-
-	result, err := registry.ExecuteRaw(
-		context.Background(),
-		"manual_call_001",
-		"read_file",
-		map[string]string{
-			"path": path,
+	client, err := provider.NewOpenAICompatibleProvider(
+		provider.OpenAICompatibleConfig{
+			BaseURL: baseURL,
+			APIKey:  apiKey,
+			Model:   model,
+			Timeout: 60 * time.Second,
 		},
 	)
 	if err != nil {
-		exitWithError("执行工具失败", err)
+		exitWithError("创建模型 Provider 失败", err)
+	}
+
+	ctx, cancel := context.WithTimeout(
+		context.Background(),
+		60*time.Second,
+	)
+	defer cancel()
+
+	response, err := client.Chat(
+		ctx,
+		provider.ChatRequest{
+			Messages: []agentcore.Message{
+				agentcore.SystemMessage(
+					"你是一个使用 Go 开发的简洁、可靠的 AI Agent。",
+				),
+				agentcore.UserMessage(prompt),
+			},
+		},
+	)
+	if err != nil {
+		exitWithError("调用模型失败", err)
 	}
 
 	fmt.Println("Go Pi Agent")
 	fmt.Println("------------")
-	fmt.Printf("Tool: %s\n", result.Name)
-	fmt.Printf("Tool Call ID: %s\n\n", result.ToolCallID)
-	fmt.Println(result.Content)
+	fmt.Println(response.Message.Content)
+	fmt.Println()
+	fmt.Printf(
+		"Finish reason: %s\n",
+		response.FinishReason,
+	)
+	fmt.Printf(
+		"Token usage: prompt=%d completion=%d total=%d\n",
+		response.Usage.PromptTokens,
+		response.Usage.CompletionTokens,
+		response.Usage.TotalTokens,
+	)
 }
 
 func exitWithError(message string, err error) {
