@@ -1,0 +1,19 @@
+# Environment variables
+.env
+.env.*
+
+# Build output
+bin/
+dist/
+go-pi-agent
+
+# Test output
+coverage.out
+*.test
+
+# macOS
+.DS_Store
+
+# IDE
+.idea/
+.vscode/
