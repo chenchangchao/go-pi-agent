@@ -14,7 +14,7 @@ User Prompt → LLM Provider → Tool Call → Go Tool Execution → Tool Result
 - [x] OpenAI-compatible Provider
 - [x] read_file 工具
 - [x] Tool Registry
-- [ ] Tool Calling 循环
+- [x] Tool Calling 循环
 - [ ] SSE 流式响应
 - [ ] 会话持久化
 - [ ] PostgreSQL 工具
