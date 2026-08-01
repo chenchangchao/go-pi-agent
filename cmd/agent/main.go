@@ -7,6 +7,7 @@ import (
 	"strings"
 	"time"
 
+	"github.com/chenchangchao/go-pi-agent/internal/agentcore"
 	"github.com/chenchangchao/go-pi-agent/internal/agenttool"
 	"github.com/chenchangchao/go-pi-agent/internal/provider"
 	"github.com/chenchangchao/go-pi-agent/internal/runtime"
@@ -85,7 +86,7 @@ func main() {
 	)
 	defer cancel()
 
-	result, err := runtime.Run(
+	stream := runtime.Stream(
 		ctx,
 		runtime.Config{
 			Provider: modelProvider,
@@ -101,21 +102,72 @@ func main() {
 		},
 		prompt,
 	)
-	if err != nil {
-		exitWithError("Agent 运行失败", err)
-	}
 
 	fmt.Println("Go Pi Agent")
 	fmt.Println("------------")
-	fmt.Println(result.Message.Content)
+
+	var finalMessage string
+	var finalTurn int
+	var toolCallCount int
+	var streamErr error
+	var printedDelta bool
+	var finalUsage agentcore.Usage
+
+	for event := range stream.Events() {
+		switch event.Type {
+		case agentcore.EventMessageDelta:
+			fmt.Print(event.Delta)
+			printedDelta = true
+
+		case agentcore.EventToolStart:
+			toolCallCount++
+
+			if printedDelta {
+				fmt.Println()
+			}
+
+			if event.ToolCall != nil {
+				fmt.Fprintf(
+					os.Stderr,
+					"\n[Tool] %s\n",
+					event.ToolCall.Name,
+				)
+			}
+
+		case agentcore.EventAgentEnd:
+			finalTurn = event.Turn
+
+			if event.Message != nil {
+				finalMessage = event.Message.Content
+			}
+			if event.Usage != nil {
+				finalUsage = *event.Usage
+			}
+
+		case agentcore.EventError:
+			streamErr = fmt.Errorf("%s", event.Error)
+		}
+	}
+
+	if streamErr != nil {
+		exitWithError("Agent 运行失败", streamErr)
+	}
+
+	// 某些模型或兼容网关可能没有产生文本 delta。
+	// 这种情况下退回打印最终完整消息。
+	if !printedDelta && finalMessage != "" {
+		fmt.Print(finalMessage)
+	}
+
 	fmt.Println()
-	fmt.Printf("Turns: %d\n", result.Turns)
-	fmt.Printf("Tool calls: %d\n", result.ToolCalls)
+	fmt.Println()
+	fmt.Printf("Turns: %d\n", finalTurn)
+	fmt.Printf("Tool calls: %d\n", toolCallCount)
 	fmt.Printf(
 		"Token usage: prompt=%d completion=%d total=%d\n",
-		result.Usage.PromptTokens,
-		result.Usage.CompletionTokens,
-		result.Usage.TotalTokens,
+		finalUsage.PromptTokens,
+		finalUsage.CompletionTokens,
+		finalUsage.TotalTokens,
 	)
 }
 
