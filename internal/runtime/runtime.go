@@ -4,13 +4,17 @@ import (
 	"context"
 	"errors"
 	"fmt"
+	"strings"
 
 	"github.com/chenchangchao/go-pi-agent/internal/agentcore"
 	"github.com/chenchangchao/go-pi-agent/internal/agenttool"
 	"github.com/chenchangchao/go-pi-agent/internal/provider"
 )
 
-const defaultMaxTurns = 8
+const (
+	defaultMaxTurns        = 8
+	defaultEventBufferSize = 32
+)
 
 // Config 定义一次 Agent 运行所需的依赖和限制。
 type Config struct {
@@ -29,18 +33,64 @@ type Result struct {
 	Usage     provider.Usage
 }
 
-// Run 执行最小 Agent 循环。
+// eventEmitter 是 Runtime 内部使用的事件发送函数。
+//
+// 当 emitter 为 nil 时，Runtime 按原来的同步模式运行，
+// 不产生任何外部事件。
+type eventEmitter func(agentcore.AgentEvent) error
+
+// Run 同步执行 Agent，并在结束后返回完整结果。
+//
+// 该接口保持与 v0.1.0 兼容。
 func Run(
 	ctx context.Context,
 	config Config,
 	userPrompt string,
 ) (Result, error) {
-	if config.Provider == nil {
-		return Result{}, errors.New("provider cannot be nil")
-	}
+	return run(ctx, config, userPrompt, nil)
+}
 
-	if config.Tools == nil {
-		return Result{}, errors.New("tool registry cannot be nil")
+// Stream 异步执行 Agent，并返回事件流。
+//
+// 当前阶段 Provider 仍然是非流式 Chat，因此暂时不会产生
+// MessageDelta。下一阶段接入 SSE 后，会在同一事件流中逐步
+// 发出 MessageDelta。
+func Stream(
+	ctx context.Context,
+	config Config,
+	userPrompt string,
+) *agentcore.EventStream {
+	stream := agentcore.NewEventStream(defaultEventBufferSize)
+
+	go func() {
+		defer stream.Close()
+
+		emit := func(event agentcore.AgentEvent) error {
+			return stream.Emit(ctx, event)
+		}
+
+		_, err := run(ctx, config, userPrompt, emit)
+		if err == nil {
+			return
+		}
+
+		// context 已取消时，事件流的消费者通常也已经停止，
+		// 因此尽力发送错误事件，不再覆盖原始错误。
+		_ = emit(agentcore.NewErrorEvent(0, err))
+	}()
+
+	return stream
+}
+
+// run 是同步运行和事件流运行共用的 Agent 核心循环。
+func run(
+	ctx context.Context,
+	config Config,
+	userPrompt string,
+	emit eventEmitter,
+) (Result, error) {
+	if err := validateConfig(config, userPrompt); err != nil {
+		return Result{}, err
 	}
 
 	maxTurns := config.MaxTurns
@@ -50,7 +100,7 @@ func Run(
 
 	messages := make([]agentcore.Message, 0, maxTurns*2+2)
 
-	if config.SystemPrompt != "" {
+	if strings.TrimSpace(config.SystemPrompt) != "" {
 		messages = append(
 			messages,
 			agentcore.SystemMessage(config.SystemPrompt),
@@ -62,10 +112,31 @@ func Run(
 		agentcore.UserMessage(userPrompt),
 	)
 
+	if err := emitEvent(
+		emit,
+		agentcore.NewAgentEvent(agentcore.EventAgentStart),
+	); err != nil {
+		return Result{}, err
+	}
+
 	var totalUsage provider.Usage
 	toolCallCount := 0
 
 	for turn := 1; turn <= maxTurns; turn++ {
+		if err := ctx.Err(); err != nil {
+			return Result{}, err
+		}
+
+		if err := emitEvent(
+			emit,
+			agentcore.NewTurnEvent(
+				agentcore.EventTurnStart,
+				turn,
+			),
+		); err != nil {
+			return Result{}, err
+		}
+
 		response, err := config.Provider.Chat(
 			ctx,
 			provider.ChatRequest{
@@ -81,43 +152,132 @@ func Run(
 			)
 		}
 
-		totalUsage.PromptTokens += response.Usage.PromptTokens
-		totalUsage.CompletionTokens += response.Usage.CompletionTokens
-		totalUsage.TotalTokens += response.Usage.TotalTokens
+		accumulateUsage(&totalUsage, response.Usage)
 
 		assistantMessage := response.Message
+
+		messageStart := agentcore.NewTurnEvent(
+			agentcore.EventMessageStart,
+			turn,
+		)
+		messageStart.Message = cloneMessagePointer(
+			assistantMessage,
+		)
+
+		if err := emitEvent(emit, messageStart); err != nil {
+			return Result{}, err
+		}
+
 		messages = append(messages, assistantMessage)
 
+		messageEnd := agentcore.NewTurnEvent(
+			agentcore.EventMessageEnd,
+			turn,
+		)
+		messageEnd.Message = cloneMessagePointer(
+			assistantMessage,
+		)
+
+		if err := emitEvent(emit, messageEnd); err != nil {
+			return Result{}, err
+		}
+
 		if len(assistantMessage.ToolCalls) == 0 {
-			return Result{
+			if err := emitEvent(
+				emit,
+				agentcore.NewTurnEvent(
+					agentcore.EventTurnEnd,
+					turn,
+				),
+			); err != nil {
+				return Result{}, err
+			}
+
+			result := Result{
 				Message:   assistantMessage,
 				Messages:  messages,
 				Turns:     turn,
 				ToolCalls: toolCallCount,
 				Usage:     totalUsage,
-			}, nil
+			}
+
+			agentEnd := agentcore.NewAgentEvent(
+				agentcore.EventAgentEnd,
+			)
+			agentEnd.Turn = turn
+			agentEnd.Message = cloneMessagePointer(
+				assistantMessage,
+			)
+
+			if err := emitEvent(emit, agentEnd); err != nil {
+				return Result{}, err
+			}
+
+			return result, nil
 		}
 
 		for _, toolCall := range assistantMessage.ToolCalls {
-			select {
-			case <-ctx.Done():
-				return Result{}, ctx.Err()
-			default:
+			if err := ctx.Err(); err != nil {
+				return Result{}, err
 			}
 
-			toolResult, err := config.Tools.Execute(ctx, toolCall)
-			if err != nil {
-				// 工具错误作为消息回填，让模型有机会修正参数，
-				// 而不是直接终止整个 Agent。
+			if err := emitEvent(
+				emit,
+				agentcore.NewToolEvent(
+					agentcore.EventToolStart,
+					turn,
+					toolCall,
+				),
+			); err != nil {
+				return Result{}, err
+			}
+
+			toolResult, toolErr := config.Tools.Execute(
+				ctx,
+				toolCall,
+			)
+
+			toolEnd := agentcore.NewToolEvent(
+				agentcore.EventToolEnd,
+				turn,
+				toolCall,
+			)
+
+			if toolErr != nil {
+				toolEnd.Error = toolErr.Error()
+
+				// 工具错误作为 ToolResult 回填，让模型有机会
+				// 修正参数或向用户解释，而不是终止整个 Agent。
 				toolResult = agentcore.ToolResultMessage(
 					toolCall.ID,
 					toolCall.Name,
-					fmt.Sprintf("工具执行失败：%v", err),
+					fmt.Sprintf(
+						"工具执行失败：%v",
+						toolErr,
+					),
 				)
+			}
+
+			toolEnd.Message = cloneMessagePointer(
+				toolResult,
+			)
+
+			if err := emitEvent(emit, toolEnd); err != nil {
+				return Result{}, err
 			}
 
 			messages = append(messages, toolResult)
 			toolCallCount++
+		}
+
+		if err := emitEvent(
+			emit,
+			agentcore.NewTurnEvent(
+				agentcore.EventTurnEnd,
+				turn,
+			),
+		); err != nil {
+			return Result{}, err
 		}
 	}
 
@@ -125,4 +285,50 @@ func Run(
 		"agent exceeded maximum turns: %d",
 		maxTurns,
 	)
+}
+
+func validateConfig(
+	config Config,
+	userPrompt string,
+) error {
+	if config.Provider == nil {
+		return errors.New("provider cannot be nil")
+	}
+
+	if config.Tools == nil {
+		return errors.New("tool registry cannot be nil")
+	}
+
+	if strings.TrimSpace(userPrompt) == "" {
+		return errors.New("user prompt cannot be empty")
+	}
+
+	return nil
+}
+
+func emitEvent(
+	emit eventEmitter,
+	event agentcore.AgentEvent,
+) error {
+	if emit == nil {
+		return nil
+	}
+
+	return emit(event)
+}
+
+func accumulateUsage(
+	total *provider.Usage,
+	current provider.Usage,
+) {
+	total.PromptTokens += current.PromptTokens
+	total.CompletionTokens += current.CompletionTokens
+	total.TotalTokens += current.TotalTokens
+}
+
+func cloneMessagePointer(
+	message agentcore.Message,
+) *agentcore.Message {
+	cloned := message
+	return &cloned
 }
