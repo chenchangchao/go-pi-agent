@@ -9,11 +9,13 @@ import (
 	"github.com/chenchangchao/go-pi-agent/internal/agentcore"
 	"github.com/chenchangchao/go-pi-agent/internal/agenttool"
 	"github.com/chenchangchao/go-pi-agent/internal/provider"
+	"github.com/chenchangchao/go-pi-agent/internal/session"
 )
 
 const (
 	defaultMaxTurns        = 8
 	defaultEventBufferSize = 32
+	defaultHistoryLimit    = 50
 )
 
 // Config 定义一次 Agent 运行所需的依赖和限制。
@@ -22,6 +24,15 @@ type Config struct {
 	Tools        *agenttool.Registry
 	SystemPrompt string
 	MaxTurns     int
+
+	// SessionStore 和 SessionID 同时设置时，
+	// Runtime 会加载并持久化该会话的历史消息。
+	SessionStore session.Store
+	SessionID    string
+
+	// HistoryLimit 限制加载的最近历史消息数量。
+	// 小于等于 0 时使用默认值。
+	HistoryLimit int
 }
 
 // Result 是一次 Agent 运行的最终结果。
@@ -31,6 +42,7 @@ type Result struct {
 	Turns     int
 	ToolCalls int
 	Usage     provider.Usage
+	SessionID string
 }
 
 // eventEmitter 是 Runtime 内部使用的事件发送函数。
@@ -98,7 +110,16 @@ func run(
 		maxTurns = defaultMaxTurns
 	}
 
-	messages := make([]agentcore.Message, 0, maxTurns*2+2)
+	historyLimit := config.HistoryLimit
+	if historyLimit <= 0 {
+		historyLimit = defaultHistoryLimit
+	}
+
+	messages := make(
+		[]agentcore.Message,
+		0,
+		historyLimit+maxTurns*2+2,
+	)
 
 	if strings.TrimSpace(config.SystemPrompt) != "" {
 		messages = append(
@@ -107,10 +128,38 @@ func run(
 		)
 	}
 
-	messages = append(
-		messages,
-		agentcore.UserMessage(userPrompt),
-	)
+	if config.SessionStore != nil {
+		history, err := loadSessionHistory(
+			ctx,
+			config.SessionStore,
+			config.SessionID,
+			historyLimit,
+		)
+		if err != nil {
+			return Result{}, fmt.Errorf(
+				"load session history: %w",
+				err,
+			)
+		}
+
+		messages = append(messages, history...)
+	}
+
+	userMessage := agentcore.UserMessage(userPrompt)
+	messages = append(messages, userMessage)
+
+	if config.SessionStore != nil {
+		if _, err := config.SessionStore.AppendMessage(
+			ctx,
+			config.SessionID,
+			userMessage,
+		); err != nil {
+			return Result{}, fmt.Errorf(
+				"persist user message: %w",
+				err,
+			)
+		}
+	}
 
 	if err := emitEvent(
 		emit,
@@ -170,6 +219,19 @@ func run(
 
 		messages = append(messages, assistantMessage)
 
+		if config.SessionStore != nil {
+			if _, err := config.SessionStore.AppendMessage(
+				ctx,
+				config.SessionID,
+				assistantMessage,
+			); err != nil {
+				return Result{}, fmt.Errorf(
+					"persist assistant message: %w",
+					err,
+				)
+			}
+		}
+
 		messageEnd := agentcore.NewTurnEvent(
 			agentcore.EventMessageEnd,
 			turn,
@@ -197,6 +259,7 @@ func run(
 				Turns:     turn,
 				ToolCalls: toolCallCount,
 				Usage:     totalUsage,
+				SessionID: config.SessionID,
 			}
 
 			// agentEnd := agentcore.NewAgentEvent(
@@ -275,6 +338,20 @@ func run(
 			}
 
 			messages = append(messages, toolResult)
+
+			if config.SessionStore != nil {
+				if _, err := config.SessionStore.AppendMessage(
+					ctx,
+					config.SessionID,
+					toolResult,
+				); err != nil {
+					return Result{}, fmt.Errorf(
+						"persist tool result: %w",
+						err,
+					)
+				}
+			}
+
 			toolCallCount++
 		}
 
@@ -299,6 +376,7 @@ func validateConfig(
 	config Config,
 	userPrompt string,
 ) error {
+
 	if config.Provider == nil {
 		return errors.New("provider cannot be nil")
 	}
@@ -309,6 +387,14 @@ func validateConfig(
 
 	if strings.TrimSpace(userPrompt) == "" {
 		return errors.New("user prompt cannot be empty")
+	}
+	hasStore := config.SessionStore != nil
+	hasSessionID := strings.TrimSpace(config.SessionID) != ""
+
+	if hasStore != hasSessionID {
+		return errors.New(
+			"session store and session ID must be configured together",
+		)
 	}
 
 	return nil
@@ -443,4 +529,35 @@ func requestAssistantMessage(
 	}
 
 	return *finalMessage, usage, nil
+}
+func loadSessionHistory(
+	ctx context.Context,
+	store session.Store,
+	sessionID string,
+	limit int,
+) ([]agentcore.Message, error) {
+	if _, err := store.GetSession(ctx, sessionID); err != nil {
+		return nil, err
+	}
+
+	storedMessages, err := store.ListMessages(
+		ctx,
+		sessionID,
+		limit,
+	)
+	if err != nil {
+		return nil, err
+	}
+
+	history := make(
+		[]agentcore.Message,
+		0,
+		len(storedMessages),
+	)
+
+	for _, stored := range storedMessages {
+		history = append(history, stored.Message)
+	}
+
+	return history, nil
 }
