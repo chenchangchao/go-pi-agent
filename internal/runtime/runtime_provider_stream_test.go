@@ -91,6 +91,7 @@ func TestRuntimeStreamUsesStreamingProvider(t *testing.T) {
 
 	var deltas strings.Builder
 	var eventTypes []agentcore.EventType
+	var finalUsage *agentcore.Usage
 
 	for event := range stream.Events() {
 		eventTypes = append(eventTypes, event.Type)
@@ -98,6 +99,19 @@ func TestRuntimeStreamUsesStreamingProvider(t *testing.T) {
 		if event.Type == agentcore.EventMessageDelta {
 			deltas.WriteString(event.Delta)
 		}
+		if event.Type == agentcore.EventAgentEnd {
+			finalUsage = event.Usage
+		}
+	}
+	if finalUsage == nil {
+		t.Fatal("expected agent_end usage")
+	}
+
+	if finalUsage.TotalTokens != 15 {
+		t.Fatalf(
+			"expected total tokens 15, got %d",
+			finalUsage.TotalTokens,
+		)
 	}
 
 	if !modelProvider.streamCalled {
@@ -125,7 +139,6 @@ func TestRuntimeStreamUsesStreamingProvider(t *testing.T) {
 		agentcore.EventTurnEnd,
 		agentcore.EventAgentEnd,
 	}
-
 	if len(eventTypes) != len(expectedOrder) {
 		t.Fatalf(
 			"expected %d events, got %d: %#v",
@@ -180,4 +193,5 @@ func TestRuntimeRunUsesSynchronousChat(t *testing.T) {
 			result.Message.Content,
 		)
 	}
+
 }

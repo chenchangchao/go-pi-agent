@@ -34,6 +34,7 @@ type AgentEvent struct {
 	Delta     string    `json:"delta,omitempty"`
 	Message   *Message  `json:"message,omitempty"`
 	ToolCall  *ToolCall `json:"tool_call,omitempty"`
+	Usage     *Usage    `json:"usage,omitempty"`
 	Error     string    `json:"error,omitempty"`
 }
 

@@ -20,11 +20,13 @@ type ChatResponse struct {
 }
 
 // Usage 记录模型本次请求的 Token 用量。
-type Usage struct {
-	PromptTokens     int
-	CompletionTokens int
-	TotalTokens      int
-}
+//
+//	type Usage struct {
+//		PromptTokens     int
+//		CompletionTokens int
+//		TotalTokens      int
+//	}
+type Usage = agentcore.Usage
 
 // Provider 是所有模型供应商必须实现的统一接口。
 type Provider interface {

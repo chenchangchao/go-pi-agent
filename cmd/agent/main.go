@@ -111,6 +111,7 @@ func main() {
 	var toolCallCount int
 	var streamErr error
 	var printedDelta bool
+	var finalUsage agentcore.Usage
 
 	for event := range stream.Events() {
 		switch event.Type {
@@ -139,6 +140,9 @@ func main() {
 			if event.Message != nil {
 				finalMessage = event.Message.Content
 			}
+			if event.Usage != nil {
+				finalUsage = *event.Usage
+			}
 
 		case agentcore.EventError:
 			streamErr = fmt.Errorf("%s", event.Error)
@@ -159,6 +163,12 @@ func main() {
 	fmt.Println()
 	fmt.Printf("Turns: %d\n", finalTurn)
 	fmt.Printf("Tool calls: %d\n", toolCallCount)
+	fmt.Printf(
+		"Token usage: prompt=%d completion=%d total=%d\n",
+		finalUsage.PromptTokens,
+		finalUsage.CompletionTokens,
+		finalUsage.TotalTokens,
+	)
 }
 
 func exitWithError(message string, err error) {

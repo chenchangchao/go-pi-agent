@@ -199,6 +199,13 @@ func run(
 				Usage:     totalUsage,
 			}
 
+			// agentEnd := agentcore.NewAgentEvent(
+			// 	agentcore.EventAgentEnd,
+			// )
+			// agentEnd.Turn = turn
+			// agentEnd.Message = cloneMessagePointer(
+			// 	assistantMessage,
+			// )
 			agentEnd := agentcore.NewAgentEvent(
 				agentcore.EventAgentEnd,
 			)
@@ -206,6 +213,9 @@ func run(
 			agentEnd.Message = cloneMessagePointer(
 				assistantMessage,
 			)
+
+			usage := totalUsage
+			agentEnd.Usage = &usage
 
 			if err := emitEvent(emit, agentEnd); err != nil {
 				return Result{}, err
