@@ -391,11 +391,12 @@ func decodeAPIError(
 }
 
 type chatCompletionRequest struct {
-	Model      string                  `json:"model"`
-	Messages   []chatCompletionMessage `json:"messages"`
-	Tools      []chatCompletionTool    `json:"tools,omitempty"`
-	ToolChoice string                  `json:"tool_choice,omitempty"`
-	Stream     bool                    `json:"stream"`
+	Model         string                       `json:"model"`
+	Messages      []chatCompletionMessage      `json:"messages"`
+	Tools         []chatCompletionTool         `json:"tools,omitempty"`
+	ToolChoice    string                       `json:"tool_choice,omitempty"`
+	Stream        bool                         `json:"stream"`
+	StreamOptions *chatCompletionStreamOptions `json:"stream_options,omitempty"`
 }
 
 type chatCompletionMessage struct {
