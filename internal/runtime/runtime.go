@@ -137,12 +137,26 @@ func run(
 			return Result{}, err
 		}
 
-		response, err := config.Provider.Chat(
+		// 必须在请求 Provider 之前发送 MessageStart。
+		// 否则流式 MessageDelta 会先于 MessageStart 到达消费者。
+		messageStart := agentcore.NewTurnEvent(
+			agentcore.EventMessageStart,
+			turn,
+		)
+
+		if err := emitEvent(emit, messageStart); err != nil {
+			return Result{}, err
+		}
+
+		assistantMessage, responseUsage, err := requestAssistantMessage(
 			ctx,
+			config.Provider,
 			provider.ChatRequest{
 				Messages: messages,
 				Tools:    config.Tools.Definitions(),
 			},
+			turn,
+			emit,
 		)
 		if err != nil {
 			return Result{}, fmt.Errorf(
@@ -152,21 +166,7 @@ func run(
 			)
 		}
 
-		accumulateUsage(&totalUsage, response.Usage)
-
-		assistantMessage := response.Message
-
-		messageStart := agentcore.NewTurnEvent(
-			agentcore.EventMessageStart,
-			turn,
-		)
-		messageStart.Message = cloneMessagePointer(
-			assistantMessage,
-		)
-
-		if err := emitEvent(emit, messageStart); err != nil {
-			return Result{}, err
-		}
+		accumulateUsage(&totalUsage, responseUsage)
 
 		messages = append(messages, assistantMessage)
 
@@ -174,9 +174,7 @@ func run(
 			agentcore.EventMessageEnd,
 			turn,
 		)
-		messageEnd.Message = cloneMessagePointer(
-			assistantMessage,
-		)
+		messageEnd.Message = cloneMessagePointer(assistantMessage)
 
 		if err := emitEvent(emit, messageEnd); err != nil {
 			return Result{}, err
@@ -331,4 +329,108 @@ func cloneMessagePointer(
 ) *agentcore.Message {
 	cloned := message
 	return &cloned
+}
+
+func requestAssistantMessage(
+	ctx context.Context,
+	modelProvider provider.Provider,
+	request provider.ChatRequest,
+	turn int,
+	emit eventEmitter,
+) (agentcore.Message, provider.Usage, error) {
+	streamingProvider, supportsStreaming :=
+		modelProvider.(provider.StreamingProvider)
+
+	// 同步 Run() 没有事件消费者时，继续使用 Chat()。
+	// 这样可以避免没有消费者时仍启动流式通道。
+	if !supportsStreaming || emit == nil {
+		response, err := modelProvider.Chat(ctx, request)
+		if err != nil {
+			return agentcore.Message{}, provider.Usage{}, err
+		}
+
+		return response.Message, response.Usage, nil
+	}
+
+	streamResult, err := streamingProvider.Stream(
+		ctx,
+		request,
+	)
+	if err != nil {
+		return agentcore.Message{}, provider.Usage{}, err
+	}
+
+	var finalMessage *agentcore.Message
+	var usage provider.Usage
+
+	for streamEvent := range streamResult.Events {
+		switch streamEvent.Type {
+		case provider.StreamEventMessageStart:
+			// Runtime 已经在 Provider 调用前发出了 MessageStart，
+			// Provider 自身的 message_start 不再重复映射。
+
+		case provider.StreamEventTextDelta:
+			if streamEvent.Delta == "" {
+				continue
+			}
+
+			if err := emitEvent(
+				emit,
+				agentcore.NewMessageDeltaEvent(
+					turn,
+					streamEvent.Delta,
+				),
+			); err != nil {
+				return agentcore.Message{}, provider.Usage{}, err
+			}
+
+		case provider.StreamEventToolDelta:
+			// 当前 MVP 不向 CLI 逐片展示半成品工具参数。
+			// 完整 ToolCall 会包含在 MessageEnd.Message 中。
+
+		case provider.StreamEventMessageEnd:
+			if streamEvent.Message == nil {
+				return agentcore.Message{},
+					provider.Usage{},
+					errors.New(
+						"stream ended without final message",
+					)
+			}
+
+			cloned := *streamEvent.Message
+			finalMessage = &cloned
+			usage = streamEvent.Usage
+
+		case provider.StreamEventError:
+			if streamEvent.Err == nil {
+				return agentcore.Message{},
+					provider.Usage{},
+					errors.New(
+						"provider stream returned empty error",
+					)
+			}
+
+			return agentcore.Message{},
+				provider.Usage{},
+				streamEvent.Err
+
+		default:
+			return agentcore.Message{},
+				provider.Usage{},
+				fmt.Errorf(
+					"unsupported provider stream event %q",
+					streamEvent.Type,
+				)
+		}
+	}
+
+	if finalMessage == nil {
+		return agentcore.Message{},
+			provider.Usage{},
+			errors.New(
+				"provider stream closed without message_end",
+			)
+	}
+
+	return *finalMessage, usage, nil
 }
